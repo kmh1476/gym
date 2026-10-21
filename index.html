@@ -253,7 +253,7 @@ function loadState(){
 function loadDraft(){try{const d=JSON.parse(localStorage.getItem(DKEY));return d&&d.exercises?d:null;}catch(e){return null;}}
 let state=loadState();
 let draft=loadDraft();
-function save(){try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}}
+function save(){state.mt=Date.now();try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}schedulePush();}
 function saveDraft(){try{if(draft)localStorage.setItem(DKEY,JSON.stringify(draft));else localStorage.removeItem(DKEY);}catch(e){}}
 
 /* ---------- 토스트 ---------- */
@@ -575,7 +575,8 @@ function vSettings(){
     <h3>루틴 편집 · 다음 운동부터 적용</h3>${prog}
     <button class="btn ghost wide" data-action="addRoutine">+ 루틴 추가</button>
     <h3>기본 휴식 시간</h3><div class="chips">${chips}</div>
-    <h3>백업 · 기록은 이 기기에만 저장돼요</h3>
+    <h3>클라우드 저장 · 선택</h3><div class="card" id="syncbox">${syncHTML()}</div>
+    <h3>백업 파일</h3>
     <div class="row2"><button class="btn" style="flex:1" data-action="export">저장</button>
     <button class="btn" style="flex:1" data-action="import">불러오기</button></div>
     <h3>초기화</h3>
@@ -599,6 +600,7 @@ function render(){
   document.body.classList.toggle('inworkout',view==='workout'&&!!draft);
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.go===view));
   updateProgress();
+  if(view==='settings')initFb();
 }
 function go(v){view=v;render();window.scrollTo(0,0);}
 
@@ -770,6 +772,12 @@ const actions={
     if(!await ask('루틴과 요일 배정을 처음 상태로 되돌릴까요?\n(기록은 그대로예요)',{danger:true,yes:'되돌리기'}))return;
     state.program=clone(DEFAULT_PROGRAM);state.plan=clone(DEFAULT_PLAN);progOpen=-1;save();render();
   },
+  async signIn(){await cloudSignIn();},
+  async signOutCloud(){
+    if(!await ask('로그아웃할까요?\n이 기기의 기록은 그대로 남아요.',{yes:'로그아웃'}))return;
+    await cloudSignOut();
+  },
+  syncNow(){pull(true);},
   export(){exportData();},
   import(){document.getElementById('imp').click();},
   async wipe(){
@@ -821,6 +829,187 @@ document.getElementById('imp').addEventListener('change',e=>{
   if(f)importData(f);
   e.target.value='';
 });
+
+/* ---------- 클라우드 저장 (선택) ---------- */
+const SKEY='gymlog_sync_v1';
+const FB_VER='10.12.2';
+let syncMeta={};
+try{syncMeta=JSON.parse(localStorage.getItem(SKEY))||{};}catch(e){}
+function saveMeta(){try{localStorage.setItem(SKEY,JSON.stringify(syncMeta));}catch(e){}}
+const sync={started:false,user:null,status:'',err:'',at:0,noConfig:false};
+let fb=null,pushT=null,pushing=false,dirty=false;
+
+function syncHTML(){
+  if(sync.noConfig)return '<div class="muted small">firebase-config.js 파일을 이 파일과 같은 폴더에 올리면 로그인할 수 있어요.</div>';
+  if(!sync.user){
+    return '<div class="muted small" style="margin-bottom:10px">로그인하면 다른 기기에서도 기록이 이어져요. 안 해도 앱은 그대로 써요.</div>'+
+      '<button class="btn primary wide" data-action="signIn">Google로 로그인</button>'+
+      (sync.err?'<div class="small" style="color:var(--danger,#e5484d);margin-top:8px">'+esc(sync.err)+'</div>':'');
+  }
+  let st='';
+  if(sync.status==='saving')st='저장 중…';
+  else if(sync.status==='ok'){const d=new Date(sync.at);st='저장됨 ✓ '+pad(d.getHours())+':'+pad(d.getMinutes());}
+  else if(sync.status==='offline')st='오프라인 · 연결되면 자동 저장';
+  else if(sync.status==='err')st='저장 실패 · 기록은 이 기기에 안전해요';
+  else st='연결됨';
+  return '<div><b>'+esc(sync.user.email||'로그인됨')+'</b></div>'+
+    '<div class="muted small" style="margin:4px 0 10px">'+esc(st)+'</div>'+
+    (sync.err?'<div class="small" style="color:var(--danger,#e5484d);margin-bottom:8px">'+esc(sync.err)+'</div>':'')+
+    '<div class="row2"><button class="btn ghost" style="flex:1" data-action="syncNow">지금 동기화</button>'+
+    '<button class="btn ghost" style="flex:1" data-action="signOutCloud">로그아웃</button></div>';
+}
+function refreshSync(){const el=document.getElementById('syncbox');if(el)el.innerHTML=syncHTML();}
+function setStatus(st,err){
+  sync.status=st;sync.err=err||'';
+  if(st==='ok')sync.at=Date.now();
+  refreshSync();
+}
+function errMsg(e){
+  const c=e&&e.code||'';
+  if(c==='permission-denied')return 'Firestore 규칙에서 이 경로를 허용해야 해요';
+  if(c==='auth/unauthorized-domain')return 'Firebase 승인된 도메인에 이 주소를 추가해야 해요';
+  if(c==='auth/operation-not-allowed')return 'Firebase에서 Google 로그인을 켜야 해요';
+  if(c==='auth/popup-closed-by-user'||c==='auth/cancelled-popup-request')return '';
+  return c||'문제가 생겼어요';
+}
+function loadScript(src){
+  return new Promise((res,rej)=>{
+    const t=document.createElement('script');t.src=src;t.onload=res;t.onerror=()=>rej(new Error('load'));setTimeout(()=>rej(new Error('timeout')),3000);
+    document.head.appendChild(t);
+  });
+}
+function pickCfg(m){
+  if(!m)return null;
+  const d=m.default;
+  return m.firebaseConfig||m.config||(m.app&&m.app.options)||(d&&(d.apiKey?d:(d.firebaseConfig||(d.options))))||(m.apiKey?m:null)||null;
+}
+async function findConfig(){
+  let cfg=null;
+  try{cfg=pickCfg(await Promise.race([import('./firebase-config.js'),new Promise((_,j)=>setTimeout(j,3000))]));}catch(e){}
+  const g=()=>{
+    if(window.firebaseConfig)return window.firebaseConfig;
+    if(window.FIREBASE_CONFIG)return window.FIREBASE_CONFIG;
+    try{if(typeof firebaseConfig!=='undefined')return firebaseConfig;}catch(e){}
+    return null;
+  };
+  cfg=cfg||g();
+  if(!cfg){try{await loadScript('firebase-config.js');}catch(e){}cfg=g();}
+  return cfg;
+}
+async function makeAdapter(){
+  if(window.__GYM_FB__)return window.__GYM_FB__;
+  const cfg=await findConfig();
+  if(!cfg||!cfg.apiKey)return null;
+  const base='https://www.gstatic.com/firebasejs/'+FB_VER+'/';
+  const [A,Au,F]=await Promise.all([import(base+'firebase-app.js'),import(base+'firebase-auth.js'),import(base+'firebase-firestore.js')]);
+  const app=A.getApps().length?A.getApp():A.initializeApp(cfg);
+  const auth=Au.getAuth(app),db=F.getFirestore(app);
+  const dref=uid=>F.doc(db,'users',uid,'gymlog','state');
+  return {
+    onUser(cb){return Au.onAuthStateChanged(auth,u=>cb(u?{uid:u.uid,email:u.email}:null));},
+    async signIn(){
+      const pr=new Au.GoogleAuthProvider();
+      try{await Au.signInWithPopup(auth,pr);}
+      catch(e){
+        if(e&&(e.code==='auth/popup-blocked'||e.code==='auth/operation-not-supported-in-this-environment')){await Au.signInWithRedirect(auth,pr);return;}
+        throw e;
+      }
+    },
+    signOut(){return Au.signOut(auth);},
+    async get(uid){const d=await F.getDoc(dref(uid));return d.exists()?d.data():null;},
+    async set(uid,obj){await F.setDoc(dref(uid),obj);}
+  };
+}
+async function initFb(){
+  if(sync.started)return;
+  sync.started=true;
+  try{fb=await makeAdapter();}catch(e){fb=null;}
+  if(!fb){sync.noConfig=true;refreshSync();return;}
+  fb.onUser(u=>{
+    sync.user=u;
+    if(u){setStatus('saving');pull(false);}
+    else{setStatus('');}
+  });
+}
+async function cloudSignIn(){
+  await initFb();
+  if(!fb){refreshSync();return;}
+  try{sync.err='';await fb.signIn();}
+  catch(e){const m=errMsg(e);setStatus('',m);if(m)toast(m);}
+}
+async function cloudSignOut(){
+  try{await fb.signOut();}catch(e){}
+  syncMeta.uid=null;saveMeta();
+  sync.user=null;setStatus('');
+}
+const withTimeout=(p,ms)=>Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej({code:'timeout'}),ms))]);
+
+function schedulePush(){
+  if(!sync.user||!fb)return;
+  dirty=true;clearTimeout(pushT);
+  pushT=setTimeout(push,1500);
+  if(sync.status!=='saving')setStatus('saving');
+}
+async function push(){
+  if(!sync.user||!fb)return;
+  if(pushing){dirty=true;return;}
+  if(navigator.onLine===false){setStatus('offline');return;}
+  pushing=true;dirty=false;
+  try{
+    await withTimeout(fb.set(sync.user.uid,{json:JSON.stringify(state),mt:state.mt||Date.now()}),15000);
+    syncMeta.uid=sync.user.uid;syncMeta.email=sync.user.email;saveMeta();
+    setStatus('ok');
+  }catch(e){setStatus(e&&e.code==='timeout'?'offline':'err',errMsg(e));}
+  pushing=false;
+  if(dirty)schedulePush();
+}
+function mergeStates(a,r){
+  const out=(a.mt||0)>=(r.mt||0)?clone(a):clone(r);
+  const ids={};out.logs=[];
+  a.logs.concat(r.logs).forEach(l=>{if(!ids[l.id]){ids[l.id]=1;out.logs.push(l);}});
+  const wd={};out.weights=[];
+  a.weights.concat(r.weights).forEach(w=>{if(!wd[w.date]){wd[w.date]=1;out.weights.push(w);}});
+  out.weights.sort((x,y)=>x.date.localeCompare(y.date));
+  return normalize(out);
+}
+function adopt(r,mt){
+  state=normalize(r);state.mt=mt;
+  try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}
+  if(view!=='workout')render();
+}
+async function pull(manual){
+  if(!sync.user||!fb)return;
+  if(pushing||dirty){return;}
+  if(navigator.onLine===false){setStatus('offline');return;}
+  let remote;
+  try{remote=await withTimeout(fb.get(sync.user.uid),15000);}
+  catch(e){setStatus(e&&e.code==='timeout'?'offline':'err',errMsg(e));return;}
+  const uid=sync.user.uid;
+  if(!remote||!remote.json){
+    syncMeta.uid=uid;saveMeta();
+    await push();return;
+  }
+  let r;
+  try{r=normalize(JSON.parse(remote.json));}catch(e){setStatus('err','클라우드 데이터를 읽지 못했어요');return;}
+  const rmt=remote.mt||0;
+  if(syncMeta.uid!==uid){
+    // 이 기기에서 처음 연결
+    const pristine=!state.logs.length&&!state.weights.length;
+    syncMeta.uid=uid;saveMeta();
+    if(pristine){adopt(r,rmt);setStatus('ok');return;}
+    state=mergeStates(state,r);state.mt=Date.now();
+    try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}
+    if(view!=='workout')render();
+    toast('클라우드 기록과 합쳤어요');
+    await push();return;
+  }
+  if(rmt>(state.mt||0)){adopt(r,rmt);setStatus('ok');if(manual)toast('최신 기록을 가져왔어요');}
+  else if((state.mt||0)>rmt){await push();}
+  else setStatus('ok');
+}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')pull(false);});
+window.addEventListener('online',()=>{if(sync.status==='offline'||sync.status==='err')schedulePush();});
+if(syncMeta.uid)initFb();
 
 render();
 })();
